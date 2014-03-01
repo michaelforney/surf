@@ -5,10 +5,10 @@ static char *useragent      = "Mozilla/5.0 (X11; U; Unix; en-US) "
 static char *stylefile      = "~/.surf/style.css";
 static char *scriptfile     = "~/.surf/script.js";
 
-static Bool kioskmode       = FALSE; /* Ignore shortcuts */
-static Bool showindicators  = TRUE;  /* Show indicators in window title */
-static Bool zoomto96dpi     = TRUE;  /* Zoom pages to always emulate 96dpi */
-static Bool runinfullscreen = FALSE; /* Run in fullscreen mode by default */
+static bool kioskmode       = false; /* Ignore shortcuts */
+static bool showindicators  = true;  /* Show indicators in window title */
+static bool zoomto96dpi     = true;  /* Zoom pages to always emulate 96dpi */
+static bool runinfullscreen = false; /* Run in fullscreen mode by default */
 
 static guint defaultfontsize = 12;   /* Default font size */
 static gfloat zoomlevel = 1.0;       /* Default zoom level */
@@ -22,14 +22,14 @@ static char *strictssl      = FALSE; /* Refuse untrusted SSL connections */
 static time_t sessiontime   = 3600;
 
 /* Webkit default features */
-static Bool enablescrollbars = TRUE;
-static Bool enablespatialbrowsing = TRUE;
-static Bool enableplugins = TRUE;
-static Bool enablescripts = TRUE;
-static Bool enableinspector = TRUE;
-static Bool loadimages = TRUE;
-static Bool hidebackground  = FALSE;
-static Bool allowgeolocation = TRUE;
+static bool enablescrollbars = true;
+static bool enablespatialbrowsing = true;
+static bool enableplugins = true;
+static bool enablescripts = true;
+static bool enableinspector = true;
+static bool loadimages = true;
+static bool hidebackground  = false;
+static bool allowgeolocation = true;
 
 #define SETPROP(p, q) { \
 	.v = (char *[]){ "/bin/sh", "-c", \
