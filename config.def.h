@@ -33,9 +33,7 @@ static bool allowgeolocation = true;
 
 #define SETPROP(p, q) { \
 	.v = (char *[]){ "/bin/sh", "-c", \
-		"prop=\"`xprop -id $2 $0 | cut -d '\"' -f 2 | xargs -0 printf %b | dmenu`\" &&" \
-		"xprop -id $2 -f $1 8s -set $1 \"$prop\"", \
-		p, q, winid, NULL \
+		"dmenu < $0/$1 > $0/$2", ctl, p, q, NULL \
 	} \
 }
 
@@ -86,9 +84,9 @@ static Key keys[] = {
     { MODKEY,               GDK_KEY_o,      source,     { 0 } },
     { MODKEY|GDK_SHIFT_MASK,GDK_KEY_o,      inspector,  { 0 } },
 
-    { MODKEY,               GDK_KEY_g,      spawn,      SETPROP("_SURF_URI", "_SURF_GO") },
-    { MODKEY,               GDK_KEY_f,      spawn,      SETPROP("_SURF_FIND", "_SURF_FIND") },
-    { MODKEY,               GDK_KEY_slash,  spawn,      SETPROP("_SURF_FIND", "_SURF_FIND") },
+    { MODKEY,               GDK_KEY_g,      spawn,      SETPROP("uri", "go") },
+    { MODKEY,               GDK_KEY_f,      spawn,      SETPROP("query", "find") },
+    { MODKEY,               GDK_KEY_slash,  spawn,      SETPROP("query", "find") },
 
     { MODKEY,               GDK_KEY_n,      find,       { .b = TRUE } },
     { MODKEY|GDK_SHIFT_MASK,GDK_KEY_n,      find,       { .b = FALSE } },

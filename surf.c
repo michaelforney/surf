@@ -4,11 +4,7 @@
  */
 
 #include <signal.h>
-#include <X11/X.h>
-#include <X11/Xatom.h>
 #include <gtk/gtk.h>
-#include <gtk/gtkx.h>
-#include <gdk/gdkx.h>
 #include <gdk/gdk.h>
 #include <gdk/gdkkeysyms.h>
 #include <string.h>
@@ -24,6 +20,8 @@
 #include <sys/file.h>
 #include <libgen.h>
 #include <stdarg.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #include "arg.h"
 
@@ -47,11 +45,13 @@ typedef struct Client {
 	GtkWidget *win, *scroll, *vbox, *pane;
 	WebKitWebView *view;
 	WebKitWebInspector *inspector;
-	char *title, *linkhover;
+	char *title, *linkhover, ctl[64], *query;
 	const char *needle;
 	gint progress;
 	struct Client *next;
 	gboolean zoomed, fullscreen, isinspecting, sslfailed;
+	int ctlfd;
+	GIOChannel *go, *find;
 } Client;
 
 typedef struct {
@@ -72,11 +72,10 @@ typedef struct {
 
 G_DEFINE_TYPE(CookieJar, cookiejar, SOUP_TYPE_COOKIE_JAR_TEXT)
 
-static Display *dpy;
-static Atom atoms[AtomLast];
 static Client *clients = NULL;
-static gboolean showxid = FALSE;
-static char winid[64];
+static unsigned numclients = 0;
+static gboolean showctl = FALSE;
+static char ctl[64];
 static gboolean usingproxy = 0;
 static char togglestat[8];
 static char pagestat[3];
@@ -120,13 +119,14 @@ static void destroywin(GtkWidget* w, Client *c);
 static void die(const char *errstr, ...);
 static void eval(Client *c, const Arg *arg);
 static void find(Client *c, const Arg *arg);
+static gboolean finddata(GIOChannel *src, GIOCondition cond, gpointer data);
 static void fullscreen(Client *c, const Arg *arg);
 static void geopolicyrequested(WebKitWebView *v, WebKitWebFrame *f,
 		WebKitGeolocationPolicyDecision *d, Client *c);
-static const char *getatom(Client *c, int a);
 static void gettogglestat(Client *c);
 static void getpagestat(Client *c);
 static char *geturi(Client *c);
+static gboolean godata(GIOChannel *src, GIOCondition cond, gpointer data);
 static gboolean initdownload(WebKitWebView *v, WebKitDownload *o, Client *c);
 
 static void inspector(Client *c, const Arg *arg);
@@ -152,14 +152,12 @@ static gboolean contextmenu(WebKitWebView *view, GtkWidget *menu,
 		WebKitHitTestResult *target, gboolean keyboard, Client *c);
 static void menuactivate(GtkMenuItem *item, Client *c);
 static void print(Client *c, const Arg *arg);
-static GdkFilterReturn processx(GdkXEvent *xevent, GdkEvent *event,
-		gpointer d);
 static void progresschange(WebKitWebView *view, GParamSpec *pspec, Client *c);
 static void reload(Client *c, const Arg *arg);
 static void scroll_h(Client *c, const Arg *arg);
 static void scroll_v(Client *c, const Arg *arg);
 static void scroll(GtkAdjustment *a, const Arg *arg);
-static void setatom(Client *c, int a, const char *v);
+static void setprop(Client *c, const char *p, const char *v);
 static void setup(void);
 static void sigchld(int unused);
 static void source(Client *c, const Arg *arg);
@@ -172,7 +170,7 @@ static void togglegeolocation(Client *c, const Arg *arg);
 static void togglescrollbars(Client *c, const Arg *arg);
 static void togglestyle(Client *c, const Arg *arg);
 static void updatetitle(Client *c);
-static void updatewinid(Client *c);
+static void updatectl(Client *c);
 static void usage(void);
 static void windowobjectcleared(GtkWidget *w, WebKitWebFrame *frame,
 		JSContextRef js, JSObjectRef win, Client *c);
@@ -448,6 +446,16 @@ destroyclient(Client *c) {
 	gtk_widget_destroy(c->scroll);
 	gtk_widget_destroy(c->vbox);
 	gtk_widget_destroy(c->win);
+	g_io_channel_unref(c->go);
+	g_io_channel_unref(c->find);
+	g_free(c->query);
+
+	unlinkat(c->ctlfd, "go", 0);
+	unlinkat(c->ctlfd, "find", 0);
+	unlinkat(c->ctlfd, "query", 0);
+	unlinkat(c->ctlfd, "uri", 0);
+	close(c->ctlfd);
+	rmdir(c->ctl);
 
 	for(p = clients; p && p->next != c; p = p->next);
 	if(p) {
@@ -477,11 +485,29 @@ die(const char *errstr, ...) {
 
 static void
 find(Client *c, const Arg *arg) {
-	const char *s;
-
-	s = getatom(c, AtomFind);
 	gboolean forward = *(gboolean *)arg;
-	webkit_web_view_search_text(c->view, s, FALSE, forward, TRUE);
+	webkit_web_view_search_text(c->view, c->query, FALSE, forward, TRUE);
+}
+
+static gboolean
+finddata(GIOChannel *src, GIOCondition cond, gpointer data) {
+	Client *c = data;
+	char *query;
+	gsize end;
+	GIOStatus status;
+	Arg arg;
+
+	status = g_io_channel_read_line(src, &query, NULL, &end, NULL);
+	if(status == G_IO_STATUS_NORMAL) {
+		query[end] = '\0';
+		setprop(c, "query", query);
+		g_free(c->query);
+		c->query = query;
+		arg.b = TRUE;
+		find(c, &arg);
+	}
+
+	return TRUE;
 }
 
 static void
@@ -504,27 +530,6 @@ geopolicyrequested(WebKitWebView *v, WebKitWebFrame *f,
 	}
 }
 
-static const char *
-getatom(Client *c, int a) {
-	static char buf[BUFSIZ];
-	Atom adummy;
-	int idummy;
-	unsigned long ldummy;
-	unsigned char *p = NULL;
-
-	XGetWindowProperty(dpy, GDK_WINDOW_XID(gtk_widget_get_window(GTK_WIDGET(c->win))),
-			atoms[a], 0L, BUFSIZ, False, XA_STRING,
-			&adummy, &idummy, &ldummy, &ldummy, &p);
-	if(p) {
-		strncpy(buf, (char *)p, LENGTH(buf)-1);
-	} else {
-		buf[0] = '\0';
-	}
-	XFree(p);
-
-	return buf;
-}
-
 static char *
 geturi(Client *c) {
 	char *uri;
@@ -535,10 +540,29 @@ geturi(Client *c) {
 }
 
 static gboolean
+godata(GIOChannel *src, GIOCondition cond, gpointer data) {
+	Client *c = data;
+	char *uri;
+	gsize end;
+	GIOStatus status;
+	Arg arg;
+
+	status = g_io_channel_read_line(src, &uri, NULL, &end, NULL);
+	if(status == G_IO_STATUS_NORMAL) {
+		uri[end] = '\0';
+		arg.v = uri;
+		loaduri(c, &arg);
+		g_free(uri);
+	}
+
+	return TRUE;
+}
+
+static gboolean
 initdownload(WebKitWebView *view, WebKitDownload *o, Client *c) {
 	Arg arg;
 
-	updatewinid(c);
+	updatectl(c);
 	arg = (Arg)DOWNLOAD((char *)webkit_download_get_uri(o), geturi(c));
 	spawn(c, &arg);
 	return FALSE;
@@ -601,7 +625,7 @@ keypress(GtkAccelGroup *group, GObject *obj,
 
 	mods = CLEANMASK(mods);
 	key = gdk_keyval_to_lower(key);
-	updatewinid(c);
+	updatectl(c);
 	for(i = 0; i < LENGTH(keys); i++) {
 		if(key == keys[i].keyval
 				&& mods == keys[i].mod
@@ -644,7 +668,7 @@ loadstatuschange(WebKitWebView *view, GParamSpec *pspec, Client *c) {
 			c->sslfailed = !(soup_message_get_flags(msg)
 			                & SOUP_MESSAGE_CERTIFICATE_TRUSTED);
 		}
-		setatom(c, AtomUri, uri);
+		setprop(c, "uri", uri);
 		break;
 	case WEBKIT_LOAD_FINISHED:
 		c->progress = 100;
@@ -675,7 +699,7 @@ loaduri(Client *c, const Arg *arg) {
 			: g_strdup_printf("http://%s", uri);
 	}
 
-	setatom(c, AtomUri, uri);
+	setprop(c, "uri", uri);
 
 	/* prevents endless loop */
 	if(strcmp(u, geturi(c)) == 0) {
@@ -704,7 +728,8 @@ newclient(void) {
 	GdkScreen *screen;
 	GdkWindow *window;
 	gdouble dpi;
-	char *uri, *ua;
+	char *uri, *ua, *runpath;
+	int fd;
 
 	if(!(c = calloc(1, sizeof(Client))))
 		die("Cannot malloc!\n");
@@ -825,7 +850,6 @@ newclient(void) {
 	gtk_window_set_geometry_hints(GTK_WINDOW(c->win), NULL, &hints,
 			GDK_HINT_MIN_SIZE);
 	gdk_window_set_events(window, GDK_ALL_EVENTS_MASK);
-	gdk_window_add_filter(window, processx, c);
 	webkit_web_view_set_full_content_zoom(c->view, TRUE);
 
 	runscript(frame);
@@ -892,18 +916,43 @@ newclient(void) {
 
 	g_free(uri);
 
-	setatom(c, AtomFind, "");
-	setatom(c, AtomUri, "about:blank");
+	runpath = getenv("XDG_RUNTIME_DIR");
+	if (!runpath)
+		runpath = "/tmp";
+	snprintf(c->ctl, LENGTH(c->ctl), "%s/surf-%d-%u",
+			runpath, getpid(), numclients++);
+	if (mkdir(c->ctl, 0700) == -1)
+	    die("Couldn't make directory '%s': %s\n", c->ctl, strerror(errno));
+	c->ctlfd = open(c->ctl, O_RDONLY);
+	if (c->ctlfd == -1)
+	    die("Couldn't open directory '%s': %s\n", c->ctl, strerror(errno));
+	if (mkfifoat(c->ctlfd, "go", 0600) == -1)
+	    die("Couldn't make fifo '%s/go': %s\n", c->ctl, strerror(errno));
+	if (mkfifoat(c->ctlfd, "find", 0600) == -1)
+	    die("Couldn't make fifo '%s/find': %s\n", c->ctl, strerror(errno));
+	fd = openat(c->ctlfd, "go", O_RDONLY | O_NONBLOCK);
+	if (fd == -1)
+	    die("Couldn't open fifo '%s/go': %s\n", c->ctl, strerror(errno));
+	c->go = g_io_channel_unix_new(fd);
+	g_io_channel_set_close_on_unref(c->go, TRUE);
+	g_io_add_watch(c->go, G_IO_IN, godata, c);
+	fd = openat(c->ctlfd, "find", O_RDONLY | O_NONBLOCK);
+	if (fd == -1)
+	    die("Couldn't open fifo '%s/find': %s\n", c->ctl, strerror(errno));
+	c->find = g_io_channel_unix_new(fd);
+	g_io_channel_set_close_on_unref(c->find, TRUE);
+	g_io_add_watch(c->find, G_IO_IN, finddata, c);
+	c->query = g_strdup("");
+	setprop(c, "uri", "about:blank");
+	setprop(c, "query", c->query);
 	if(hidebackground)
 		webkit_web_view_set_transparent(c->view, TRUE);
 
 	c->next = clients;
 	clients = c;
 
-	if(showxid) {
-		gdk_display_sync(gtk_widget_get_display(c->win));
-		printf("%u\n",
-			(guint)GDK_WINDOW_XID(window));
+	if(showctl) {
+		puts(c->ctl);
 		fflush(NULL);
                 if (fclose(stdout) != 0) {
 			die("Error closing stdout");
@@ -932,7 +981,7 @@ newwindow(Client *c, const Arg *arg) {
 		cmd[i++] = "-p";
 	if(!enablescripts)
 		cmd[i++] = "-s";
-	if(showxid)
+	if(showctl)
 		cmd[i++] = "-x";
 	cmd[i++] = "-c";
 	cmd[i++] = cookiefile;
@@ -997,31 +1046,6 @@ print(Client *c, const Arg *arg) {
 	webkit_web_frame_print(webkit_web_view_get_main_frame(c->view));
 }
 
-static GdkFilterReturn
-processx(GdkXEvent *e, GdkEvent *event, gpointer d) {
-	Client *c = (Client *)d;
-	XPropertyEvent *ev;
-	Arg arg;
-
-	if(((XEvent *)e)->type == PropertyNotify) {
-		ev = &((XEvent *)e)->xproperty;
-		if(ev->state == PropertyNewValue) {
-			if(ev->atom == atoms[AtomFind]) {
-				arg.b = TRUE;
-				find(c, &arg);
-
-				return GDK_FILTER_REMOVE;
-			} else if(ev->atom == atoms[AtomGo]) {
-				arg.v = getatom(c, AtomGo);
-				loaduri(c, &arg);
-
-				return GDK_FILTER_REMOVE;
-			}
-		}
-	}
-	return GDK_FILTER_CONTINUE;
-}
-
 static void
 progresschange(WebKitWebView *view, GParamSpec *pspec, Client *c) {
 	c->progress = webkit_web_view_get_progress(c->view) * 100;
@@ -1074,11 +1098,13 @@ scroll(GtkAdjustment *a, const Arg *arg) {
 }
 
 static void
-setatom(Client *c, int a, const char *v) {
-	XSync(dpy, False);
-	XChangeProperty(dpy, GDK_WINDOW_XID(gtk_widget_get_window(GTK_WIDGET(c->win))),
-			atoms[a], XA_STRING, 8, PropModeReplace,
-			(unsigned char *)v, strlen(v) + 1);
+setprop(Client *c, const char *p, const char *v) {
+	int fd;
+
+	fd = openat(c->ctlfd, p, O_CREAT|O_TRUNC|O_WRONLY, 0600);
+	if (fd == -1) return;
+	write(fd, v, strlen(v));
+	close(fd);
 }
 
 static void
@@ -1092,13 +1118,6 @@ setup(void) {
 	/* clean up any zombies immediately */
 	sigchld(0);
 	gtk_init(NULL, NULL);
-
-	dpy = GDK_DISPLAY_XDISPLAY(gdk_display_get_default());
-
-	/* atoms */
-	atoms[AtomFind] = XInternAtom(dpy, "_SURF_FIND", False);
-	atoms[AtomGo] = XInternAtom(dpy, "_SURF_GO", False);
-	atoms[AtomUri] = XInternAtom(dpy, "_SURF_URI", False);
 
 	/* dirs and files */
 	cookiefile = buildpath(cookiefile);
@@ -1155,8 +1174,6 @@ source(Client *c, const Arg *arg) {
 static void
 spawn(Client *c, const Arg *arg) {
 	if(fork() == 0) {
-		if(dpy)
-			close(ConnectionNumber(dpy));
 		setsid();
 		execvp(((char **)arg->v)[0], (char **)arg->v);
 		fprintf(stderr, "surf: execvp %s", ((char **)arg->v)[0]);
@@ -1356,9 +1373,8 @@ updatetitle(Client *c) {
 }
 
 static void
-updatewinid(Client *c) {
-	snprintf(winid, LENGTH(winid), "%u",
-			(int)GDK_WINDOW_XID(gtk_widget_get_window(GTK_WIDGET(c->win))));
+updatectl(Client *c) {
+	snprintf(ctl, LENGTH(ctl), "%s", c->ctl);
 }
 
 static void
@@ -1468,7 +1484,7 @@ main(int argc, char *argv[]) {
 		die("surf-"VERSION", ©2009-2014 surf engineers, "
 				"see LICENSE for details\n");
 	case 'x':
-		showxid = TRUE;
+		showctl = TRUE;
 		break;
 	case 'z':
 		zoomlevel = strtof(EARGF(usage()), NULL);
