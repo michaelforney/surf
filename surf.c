@@ -75,7 +75,6 @@ G_DEFINE_TYPE(CookieJar, cookiejar, SOUP_TYPE_COOKIE_JAR_TEXT)
 static Display *dpy;
 static Atom atoms[AtomLast];
 static Client *clients = NULL;
-static Window embed = 0;
 static gboolean showxid = FALSE;
 static char winid[64];
 static gboolean usingproxy = 0;
@@ -147,7 +146,7 @@ static void loadstatuschange(WebKitWebView *view, GParamSpec *pspec,
 static void loaduri(Client *c, const Arg *arg);
 static void navigate(Client *c, const Arg *arg);
 static Client *newclient(void);
-static void newwindow(Client *c, const Arg *arg, gboolean noembed);
+static void newwindow(Client *c, const Arg *arg);
 static void pasteuri(GtkClipboard *clipboard, const char *text, gpointer d);
 static gboolean contextmenu(WebKitWebView *view, GtkWidget *menu,
 		WebKitHitTestResult *target, gboolean keyboard, Client *c);
@@ -252,7 +251,8 @@ buttonrelease(WebKitWebView *web, GdkEventButton *e, GList *gl) {
 		if(e->button == 2 ||
 				(e->button == 1 && CLEANMASK(e->state) == CLEANMASK(MODKEY))) {
 			g_object_get(result, "link-uri", &arg.v, NULL);
-			newwindow(NULL, &arg, e->state & GDK_CONTROL_MASK);
+                        /* TODO: Figure out alternative way to deal with tabs. */
+			newwindow(NULL, &arg);
 			return true;
 		}
 	}
@@ -427,7 +427,7 @@ decidewindow(WebKitWebView *view, WebKitWebFrame *f, WebKitNetworkRequest *r,
 			WEBKIT_WEB_NAVIGATION_REASON_LINK_CLICKED) {
 		webkit_web_policy_decision_ignore(p);
 		arg.v = (void *)webkit_network_request_get_uri(r);
-		newwindow(NULL, &arg, 0);
+		newwindow(NULL, &arg);
 		return TRUE;
 	}
 	return FALSE;
@@ -713,25 +713,21 @@ newclient(void) {
 	c->progress = 100;
 
 	/* Window */
-	if(embed) {
-		c->win = gtk_plug_new(embed);
-	} else {
-		c->win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+	c->win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 
-		/* TA:  20091214:  Despite what the GNOME docs say, the ICCCM
-		 * is always correct, so we should still call this function.
-		 * But when doing so, we *must* differentiate between a
-		 * WM_CLASS and a resource on the window.  By convention, the
-		 * window class (WM_CLASS) is capped, while the resource is in
-		 * lowercase.   Both these values come as a pair.
-		 */
-		gtk_window_set_wmclass(GTK_WINDOW(c->win), "surf", "Surf");
+	/* TA:  20091214:  Despite what the GNOME docs say, the ICCCM
+	 * is always correct, so we should still call this function.
+	 * But when doing so, we *must* differentiate between a
+	 * WM_CLASS and a resource on the window.  By convention, the
+	 * window class (WM_CLASS) is capped, while the resource is in
+	 * lowercase.   Both these values come as a pair.
+	 */
+	gtk_window_set_wmclass(GTK_WINDOW(c->win), "surf", "Surf");
 
-		/* TA:  20091214:  And set the role here as well -- so that
-		 * sessions can pick this up.
-		 */
-		gtk_window_set_role(GTK_WINDOW(c->win), "Surf");
-	}
+	/* TA:  20091214:  And set the role here as well -- so that
+	 * sessions can pick this up.
+	 */
+	gtk_window_set_role(GTK_WINDOW(c->win), "Surf");
 
 	gtk_widget_realize(GTK_WIDGET(c->win));
 	window = gtk_widget_get_window(GTK_WIDGET(c->win));
@@ -918,22 +914,16 @@ newclient(void) {
 }
 
 static void
-newwindow(Client *c, const Arg *arg, gboolean noembed) {
+newwindow(Client *c, const Arg *arg) {
 	guint i = 0;
 	const char *cmd[16], *uri;
 	const Arg a = { .v = (void *)cmd };
-	char tmp[64];
 
 	cmd[i++] = argv0;
 	cmd[i++] = "-a";
 	cmd[i++] = cookiepolicies;
 	if(!enablescrollbars)
 		cmd[i++] = "-b";
-	if(embed && !noembed) {
-		cmd[i++] = "-e";
-		snprintf(tmp, LENGTH(tmp), "%u\n", (int)embed);
-		cmd[i++] = tmp;
-	}
 	if(!loadimages)
 		cmd[i++] = "-i";
 	if(kioskmode)
@@ -1422,9 +1412,6 @@ main(int argc, char *argv[]) {
 		break;
 	case 'c':
 		cookiefile = EARGF(usage());
-		break;
-	case 'e':
-		embed = strtol(EARGF(usage()), NULL, 0);
 		break;
 	case 'f':
 		runinfullscreen = 1;
